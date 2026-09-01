@@ -245,7 +245,7 @@ show_services() {
 }
 
 show_ports() {
-    local netid state recvq sendq local_addr peer_addr process state_zh ports
+    local netid state local_addr process state_zh ports
 
     need_command ss
     if ! ports="$(ss -lntupH)"; then
@@ -253,7 +253,7 @@ show_ports() {
     fi
     printf '%-6s | %-8s | %-28s | %s\n' '协议' '状态' '本地监听地址' '进程'
     printf '%s\n' '-------+----------+------------------------------+------------------------------'
-    while read -r netid state recvq sendq local_addr peer_addr process; do
+    while read -r netid state _ _ local_addr _ process; do
         [[ -n "$netid" ]] || continue
         case "$state" in
             LISTEN) state_zh='监听' ;;
