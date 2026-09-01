@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
-export LC_ALL=C.UTF-8
+
+readonly VERSION='0.2.0'
 
 usage() {
     cat <<'HELP'
@@ -13,8 +14,10 @@ usage() {
   service-manager-cn.sh list            查看运行中的系统服务
   service-manager-cn.sh list-all        查看全部系统服务
   service-manager-cn.sh user-list       查看运行中的用户服务
+  service-manager-cn.sh user-list-all   查看全部用户服务
   service-manager-cn.sh ports           查看监听端口
   service-manager-cn.sh docker          查看 Docker 容器
+  service-manager-cn.sh --version       查看版本
   service-manager-cn.sh 操作 服务名     管理系统服务
   service-manager-cn.sh user-操作 服务名
                                        管理当前用户的服务
@@ -45,32 +48,57 @@ set_scope() {
     fi
 }
 
+check_systemd_manager() {
+    local scope="$1"
+
+    need_command systemctl
+    set_scope "$scope"
+    if ! "${CTL[@]}" show-environment >/dev/null 2>&1; then
+        if [[ "$scope" == user ]]; then
+            die '无法连接当前用户的 systemd 管理器。请在已登录的用户会话中运行，或检查用户服务是否已启用。'
+        fi
+        die '无法连接系统 systemd 管理器。此工具仅支持采用 systemd 的 Linux 系统。'
+    fi
+}
+
 normalize_service() {
     local scope="$1"
     local service="$2"
     local load_state
 
     [[ -n "$service" ]] || die '服务名不能为空'
-    [[ "$service" =~ ^[[:alnum:]_.@:-]+$ ]] || die "无效的服务名：$service"
+    [[ "$service" =~ ^[[:alnum:]_][[:alnum:]_.@:-]*$ ]] || die "无效的服务名：$service"
     [[ "$service" == *.service ]] || service="${service}.service"
 
-    set_scope "$scope"
-    load_state="$("${CTL[@]}" show "$service" -p LoadState --value 2>/dev/null || true)"
+    check_systemd_manager "$scope"
+    if ! load_state="$("${CTL[@]}" show -p LoadState --value "$service" 2>/dev/null)"; then
+        die "无法读取服务状态：$service"
+    fi
     [[ "$load_state" == loaded ]] || die "找不到服务：$service"
     printf '%s\n' "$service"
 }
 
-load_properties() {
-    local scope="$1"
-    local service="$2"
-    local key value
-
+reset_service_properties() {
+    SERVICE_ID=''
     SERVICE_ACTIVE=''
     SERVICE_ENABLED=''
     SERVICE_DESCRIPTION=''
     SERVICE_PID=''
     SERVICE_SINCE=''
+}
+
+load_properties() {
+    local scope="$1"
+    local service="$2"
+    local properties key value
+
+    reset_service_properties
     set_scope "$scope"
+    if ! properties="$("${CTL[@]}" show \
+        -p ActiveState -p UnitFileState -p Description -p MainPID \
+        -p ActiveEnterTimestamp "$service" 2>/dev/null)"; then
+        die "无法读取服务状态：$service"
+    fi
 
     while IFS='=' read -r key value; do
         case "$key" in
@@ -80,9 +108,7 @@ load_properties() {
             MainPID) SERVICE_PID="$value" ;;
             ActiveEnterTimestamp) SERVICE_SINCE="$value" ;;
         esac
-    done < <("${CTL[@]}" show "$service" \
-        -p ActiveState -p UnitFileState -p Description -p MainPID \
-        -p ActiveEnterTimestamp 2>/dev/null)
+    done <<< "$properties"
 }
 
 service_description_zh() {
@@ -157,40 +183,78 @@ enable_state_zh() {
 show_services() {
     local scope="$1"
     local mode="$2"
-    local unit
+    local unit listing properties key value
     local -a units=()
 
-    need_command systemctl
-    set_scope "$scope"
+    check_systemd_manager "$scope"
     if [[ "$mode" == running ]]; then
-        mapfile -t units < <("${CTL[@]}" list-units --type=service --state=running \
-            --no-legend --no-pager --plain | awk '{print $1}')
+        if ! listing="$("${CTL[@]}" list-units --type=service --state=running \
+            --no-legend --no-pager --plain)"; then
+            die '无法列出正在运行的服务。'
+        fi
     else
-        mapfile -t units < <("${CTL[@]}" list-unit-files --type=service \
-            --no-legend --no-pager | awk '{print $1}')
+        if ! listing="$("${CTL[@]}" list-unit-files --type=service \
+            --no-legend --no-pager)"; then
+            die '无法列出系统服务。'
+        fi
     fi
+
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        units+=("${unit%%[[:space:]]*}")
+    done <<< "$listing"
 
     ((${#units[@]} > 0)) || { printf '没有找到服务。\n'; return; }
 
+    if ! properties="$("${CTL[@]}" show \
+        -p Id -p ActiveState -p UnitFileState -p Description -p MainPID \
+        -p ActiveEnterTimestamp "${units[@]}" 2>/dev/null)"; then
+        die '无法读取服务属性。'
+    fi
+
     printf '%-36s | %-10s | %-10s | %s\n' '服务名称' '运行状态' '开机状态' '中文说明'
     printf '%s\n' '-------------------------------------+------------+------------+----------------------------------------'
-    for unit in "${units[@]}"; do
-        load_properties "$scope" "$unit"
+    reset_service_properties
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        case "$key" in
+            Id)
+                if [[ -n "$SERVICE_ID" ]]; then
+                    printf '%-36s | %-10s | %-10s | %s\n' \
+                        "$SERVICE_ID" \
+                        "$(active_state_zh "$SERVICE_ACTIVE")" \
+                        "$(enable_state_zh "$SERVICE_ENABLED")" \
+                        "$(service_description_zh "$SERVICE_ID" "$SERVICE_DESCRIPTION")"
+                fi
+                reset_service_properties
+                SERVICE_ID="$value"
+                ;;
+            ActiveState) SERVICE_ACTIVE="$value" ;;
+            UnitFileState) SERVICE_ENABLED="$value" ;;
+            Description) SERVICE_DESCRIPTION="$value" ;;
+            MainPID) SERVICE_PID="$value" ;;
+            ActiveEnterTimestamp) SERVICE_SINCE="$value" ;;
+        esac
+    done <<< "$properties"
+    if [[ -n "$SERVICE_ID" ]]; then
         printf '%-36s | %-10s | %-10s | %s\n' \
-            "$unit" \
+            "$SERVICE_ID" \
             "$(active_state_zh "$SERVICE_ACTIVE")" \
             "$(enable_state_zh "$SERVICE_ENABLED")" \
-            "$(service_description_zh "$unit" "$SERVICE_DESCRIPTION")"
-    done
+            "$(service_description_zh "$SERVICE_ID" "$SERVICE_DESCRIPTION")"
+    fi
 }
 
 show_ports() {
-    local netid state recvq sendq local_addr peer_addr process state_zh
+    local netid state local_addr process state_zh ports
 
     need_command ss
+    if ! ports="$(ss -lntupH)"; then
+        die '无法读取监听端口。请检查权限或 ss 命令是否可用。'
+    fi
     printf '%-6s | %-8s | %-28s | %s\n' '协议' '状态' '本地监听地址' '进程'
     printf '%s\n' '-------+----------+------------------------------+------------------------------'
-    while read -r netid state recvq sendq local_addr peer_addr process; do
+    while read -r netid state _ _ local_addr _ process; do
+        [[ -n "$netid" ]] || continue
         case "$state" in
             LISTEN) state_zh='监听' ;;
             UNCONN) state_zh='无连接' ;;
@@ -198,7 +262,7 @@ show_ports() {
         esac
         printf '%-6s | %-8s | %-28s | %s\n' \
             "$netid" "$state_zh" "$local_addr" "${process:--}"
-    done < <(ss -lntupH)
+    done <<< "$ports"
 }
 
 show_docker() {
@@ -253,6 +317,7 @@ manage_service() {
             return
             ;;
         logs)
+            need_command journalctl
             printf '正在显示 %s 最近 50 行日志：\n\n' "$service"
             if [[ "$scope" == user ]]; then
                 journalctl --user -u "$service" -n 50 --no-pager
@@ -376,6 +441,7 @@ main() {
             manage_service user "$action" "$2"
             ;;
         -h|--help|help) usage ;;
+        -v|--version|version) printf 'service-manager-cn %s\n' "$VERSION" ;;
         *) usage >&2; die "未知命令：$command" ;;
     esac
 }
